@@ -25,36 +25,16 @@
 
 ; config statements should precede project file includes.
 #include <xc.inc>  
-    ; General Purpose Registers (bank 0)
-    rx_byte       EQU 0x20 ; Used to store the received byte
-    rx_state      EQU 0x21 ; Used to track the current receive state
-    rx_command    EQU 0x22 ; Used to store the received command
-    reply_pending EQU 0x23 ; Used to track if a reply is needed
-    adc_state     EQU 0x24 ; Used to track the ADC conversion state
-    adc_high      EQU 0x25 ; Used to store the high ADC byte
-    adc_low       EQU 0x26 ; Used to store the low ADC byte
-    tx_length     EQU 0x27 ; Used to store the number of bytes to send
-    tx_count      EQU 0x28 ; Used to count the bytes being sent
-     
-    ; Transmit Packet Buffer
-    tx_data0      EQU 0x29 ; Packet byte 0
-    tx_data1      EQU 0x2A ; Packet byte 1
-    tx_data2      EQU 0x2B ; Packet byte 2
-    tx_data3      EQU 0x2C ; Packet byte 3
-    tx_data4      EQU 0x2D ; Packet byte 4
-    tx_data5      EQU 0x2E ; Packet byte 5
-      
-    ; New servo registers
-    servo_rx_h    EQU 0x30  ; High byte from S packet
-    servo_rx_l    EQU 0x31  ; Low byte from S packet
-    servo_next_h  EQU 0x32  ; Saved high byte for next frame
-    servo_next_l  EQU 0x33  ; Saved low byte for next frame
-    servo_busy    EQU 0x34  ; 1 while RC2 servo pulse is HIGH
+    ; General Purpose Registers
+    selected_value EQU 0x20 ; Pending RAM selection: A or B
+    stored_value   EQU 0x21 ; Value read from EEPROM
+    write_down     EQU 0x22 ; 1 when Write button is held
+    select_down    EQU 0x23 ; 1 when Select button is held
+    delay_outer    EQU 0x24 ; Outer debounce delay counter
+    delay_inner    EQU 0x25 ; Inner debounce delay counter
 
-    ; Interrupt save registers (shared/common RAM)
-    W_TEMP        EQU 0x70
-    STATUS_TEMP   EQU 0x71
-    PCLATH_TEMP   EQU 0x72
+    ; EEPROM address
+    DATA_EE_ADDR   EQU 0x00 ; Store our character at address 0
  
 ; Reset Vector at 0000h. Execution starts here after reset.
 PSECT resetVect,class=CODE,delta=2
@@ -64,667 +44,308 @@ ResetVector:
 ; Interrupt Vector
 PSECT isrVect,class=CODE,delta=2
 InterruptVector:
-    GOTO ISRHandler
 
 ; Main code section starts at 0008h. User code goes here.
 PSECT code,class=CODE,delta=2
- 
-Setup: 
-; Configure UART pins
-    BANKSEL PORTC
-    BCF PORTC,2	     ; Making RC2 an output
-    BANKSEL TRISC
-    BCF TRISC,2      ; RC2 is the servo signal output
-    BSF TRISC,6      ; RC6/TX for transmission
-    BSF TRISC,7      ; RC7/RX for reception
 
-    ; Configure RB0 as diagnostic output
-    BANKSEL ANSELH
-    CLRF ANSELH      ; Set PORTB analog pins to digital
-    BANKSEL PORTB
-    BCF PORTB,0      ; Start RB0 LOW
-    BANKSEL TRISB
-    BCF TRISB,0      ; RB0 as output
-
-    ; Configure EUSART Transmitter
-    BANKSEL TXSTA
-    MOVLW 0x24       ; 8-bit, asynchronous, BRGH=1, TXEN=1
-    MOVWF TXSTA
-
-    ; Configure Baud Rate Generator
-    BANKSEL BAUDCTL
-    CLRF BAUDCTL     ; BRG16=0, 8-bit baud generator
-    BANKSEL SPBRG
-    MOVLW 25
-    MOVWF SPBRG      ; 9600 baud at 4 MHz
-
-    ; Configure AN0 for ADC
-    BSF TRISA,0      ; RA0/AN0 input
-    BCF TRISA,1      ; RA1 diagnostic output
+Setup:
+    ; Disable analog inputs
     BANKSEL ANSEL
-    MOVLW 0x01
-    MOVWF ANSEL      ; Enable AN0 analog input
+    CLRF ANSEL
+    CLRF ANSELH
 
-    ; Configure ADC
-    BANKSEL ADCON1
+    ; Configure diagnostic outputs
+    BANKSEL PORTA
+    BCF PORTA,1	    ; Read diagnostic LOW
+    BCF PORTA,2     ; Write diagnostic LOW
+
+    ; Configure display outputs
+    BANKSEL PORTC
     MOVLW 0x80
-    MOVWF ADCON1     ; Right-justified, VDD/VSS references
-    BANKSEL ADCON0
+    MOVWF PORTC     ; Display Write HIGH
+
+    ; Configure input and output pins
+    BANKSEL TRISA
+    BCF TRISA,1	    ; RA1 read diagnostic
+    BCF TRISA,2     ; RA2 write diagnostic
+    BSF TRISB,0     ; RB0 Select button
+    BSF TRISB,1     ; RB1 Write button
+    CLRF TRISC      ; PORTC display outputs
+
+    ; Enable PORTB weak pull-ups
+    MOVLW 0x03
+    MOVWF WPUB      ; Enable RB0 and RB1 pull-ups
+    BCF OPTION_REG,7 ; Enable weak pull-ups
+
+    ; Configure EEPROM
+    BANKSEL EECON1
+    BCF EECON1,7     ; Select data EEPROM
+    BCF EECON1,2     ; Disable EEPROM writing
+
+    ; Initialize GPRs
+    BANKSEL selected_value
     MOVLW 0x41
-    MOVWF ADCON0     ; FOSC/8, AN0, ADC enabled
+    MOVWF selected_value ; Start selection at A
+    CLRF stored_value
+    CLRF write_down
+    CLRF select_down
 
-    ; Initialize General Purpose Registers
-    BANKSEL rx_byte
-    CLRF rx_byte
-    CLRF rx_state
-    CLRF rx_command
-    CLRF reply_pending
-    CLRF adc_state
-    CLRF adc_high
-    CLRF adc_low
-    CLRF tx_length
-    CLRF tx_count
-    CLRF servo_rx_h
-    CLRF servo_rx_l
-    CLRF servo_busy
-    
-    ; Start with 1500 us: 0xB1E0 + 1500 = 0xB7BC
-    MOVLW 0xB7
-    MOVWF servo_next_h
-    MOVLW 0xBC
-    MOVWF servo_next_l
-    BCF STATUS,7     ; IRP=0: FSR will point into bank 0
+    ; Wait until Write button is released
+    BANKSEL PORTB
+    BTFSS PORTB,1
+    GOTO WaitStartupRelease
+    CALL Delay10ms  ; Debounce release
+    BANKSEL PORTB
+    BTFSS PORTB,1
+    GOTO WaitStartupRelease
 
-    ; Enable EUSART Receiver
-    BANKSEL RCSTA
-    MOVLW 0x90
-    MOVWF RCSTA      ; SPEN=1, CREN=1, 8-bit reception
-
-    ; Disable interrupts for polling
-    BANKSEL INTCON
-    BCF INTCON,7     ; Disable global interrupts
-    BCF INTCON,6     ; Disable peripheral interrupts
-    
-    ; CCP1 compare generates an interrupt without controlling RC2
-    BANKSEL CCP1CON
-    MOVLW 0x0A       ; Software interrupt on compare match
-    MOVWF CCP1CON
-    BANKSEL CCPR1H
-    MOVLW 0xB7
-    MOVWF CCPR1H
-    MOVLW 0xBC
-    MOVWF CCPR1L
-
-    ; Set Timer1 for internal clock and 1:1 prescaler (1 us/tick)
-    BANKSEL T1CON
-    CLRF T1CON       ; Stop Timer1 while setting it up
-    BANKSEL TMR1H
-    MOVLW 0xB1
-    MOVWF TMR1H
-    MOVLW 0xE0
-    MOVWF TMR1L      ; 65536 - 20000 = 0xB1E0
-
-    ; Clear old interrupt flags
-    BANKSEL PIR1
-    BCF PIR1,0       ; Timer1 flag
-    BCF PIR1,2       ; CCP1 flag
-
-    ; Enable Timer1 interrupt; CCP1 enabled at frame start
-    BANKSEL PIE1
-    BSF PIE1,0       ; TMR1IE=1
-    BCF PIE1,2       ; CCP1IE=0 until first frame
-    BANKSEL INTCON
-    BSF INTCON,6     ; Enable peripheral interrupts
-    BSF INTCON,7     ; Enable global interrupts
-    BANKSEL T1CON
-    BSF T1CON,0      ; Start Timer1
-
-
-GOTO Main    
+GOTO Main
 
 Main:
-    ; Only start foreground work when servo pulse is LOW
-    BANKSEL servo_busy
-    MOVF servo_busy,F
-    BTFSS STATUS,2
-    GOTO Main        ; Do not start work while servo is HIGH
+    ; Check both buttons
+    CALL CheckWrite
+    CALL CheckSelect
 
-    ; Pulse RA1 to show each receive-service opportunity
+    ; If Write is held, display the RAM selection
+    BANKSEL write_down
+    BTFSC write_down,0
+    GOTO ShowSelection
+    CALL ReadEEPROM ; Continuously read and display EEPROM
+
+    ; Check for stored A
+    BANKSEL stored_value
+    MOVF stored_value,W
+    XORLW 0x41
+    BTFSC STATUS,2
+    GOTO ShowStored
+
+    ; Check for stored B
+    MOVF stored_value,W
+    XORLW 0x42
+    BTFSC STATUS,2
+    GOTO ShowStored
+
+    ; Unknown EEPROM data displays ?
+    MOVLW 0x3F
+    CALL DisplayChar
+    GOTO Main
+
+ShowStored:
+    BANKSEL stored_value
+    MOVF stored_value,W
+    CALL DisplayChar
+    GOTO Main
+    
+ShowSelection:
+    ; Display the pending RAM selection
+    ; Do not write EEPROM while Write is held
+    BANKSEL selected_value
+    MOVF selected_value,W
+    CALL DisplayChar
+    GOTO Main
+
+CheckWrite:
+    BANKSEL PORTB
+    BTFSC PORTB,1         ; HIGH means released
+    GOTO WriteReleased
+
+    ; Button is physically LOW
+    BANKSEL write_down
+    BTFSC write_down,0
+    RETURN               ; Already registered as pressed
+
+    ; Check that the press remains LOW after debounce
+    CALL Delay10ms
+    BANKSEL PORTB
+    BTFSC PORTB,1
+    RETURN               ; Bounce, not a valid press
+
+    BANKSEL write_down
+    BSF write_down,0     ; Enter selection mode
+    RETURN               ; Do not write on press
+
+WriteReleased:
+    BANKSEL write_down
+    BTFSS write_down,0
+    RETURN               ; No earlier valid press
+
+    ; Verify that the button stays released
+    CALL Delay10ms
+    BANKSEL PORTB
+    BTFSS PORTB,1
+    RETURN               ; Bounce, not a valid release
+
+    BANKSEL write_down
+    BCF write_down,0      ; End selection mode
+
+    ; One completed press-and-release cycle
+    CALL WriteEEPROM     ; Write exactly once
+    RETURN
+
+CheckSelect:
+    BANKSEL PORTB
+    BTFSC PORTB,0         ; HIGH means released
+    GOTO SelectReleased
+
+    ; Button is physically LOW
+    BANKSEL select_down
+    BTFSC select_down,0
+    RETURN               ; Already registered as pressed
+    CALL Delay10ms
+    BANKSEL PORTB
+    BTFSC PORTB,0
+    RETURN               ; Invalid press due to bounce
+
+    BANKSEL select_down
+    BSF select_down,0    ; Remember valid press
+
+    ; Only toggle while Write is being held
+    BANKSEL write_down
+    BTFSS write_down,0
+    RETURN
+
+    ; Check if the current selection is A
+    MOVF selected_value,W
+    XORLW 0x41
+    BTFSC STATUS,2
+    GOTO SelectB
+    
+    ; Otherwise select the Character "A"
+    MOVLW 0x41		 
+    MOVWF selected_value
+    RETURN
+
+SelectB:
+    MOVLW 0x42		 ; Display the Character "B"
+    MOVWF selected_value
+    RETURN
+
+SelectReleased:
+    BANKSEL select_down
+    BTFSS select_down,0
+    RETURN               ; Already registered as released
+    CALL Delay10ms
+    BANKSEL PORTB
+    BTFSS PORTB,0
+    RETURN               ; Release was only bounce
+    BANKSEL select_down
+    BCF select_down,0
+    RETURN
+    
+ReadEEPROM:
+    ; Start read timing diagnostic
     BANKSEL PORTA
-    BSF PORTA,1
-    BCF PORTA,1
-    CALL ServiceRx
+    BSF PORTA,1           ; RA1 HIGH
 
-    BANKSEL servo_busy
-    MOVF servo_busy,F
-    BTFSS STATUS,2
-    GOTO Main
-    CALL ServiceReply
+    ; Select EEPROM address 0x00
+    BANKSEL EEADR
+    MOVLW DATA_EE_ADDR
+    MOVWF EEADR
 
-    BANKSEL servo_busy
-    MOVF servo_busy,F
-    BTFSS STATUS,2
-    GOTO Main
-    CALL ServiceTx
-    GOTO Main            
+    ; Select data EEPROM and begin reading
+    BANKSEL EECON1
+    BCF EECON1,7          ; EEPGD = 0
+    BSF EECON1,0          ; RD = 1
 
-ServiceRx:
-    ; RCSTA, PIR1, RCREG, and our GPRs are all in bank 0
-    BANKSEL RCSTA
+    ; Read the saved data into RAM
+    BANKSEL EEDAT
+    MOVF EEDAT,W
+    BANKSEL stored_value
+    MOVWF stored_value
 
-    ; Check if the receiver has an overrun error
-    BTFSC RCSTA,1
-    GOTO RxOverrun
-
-    ; Check if a new byte has been received
-    BTFSS PIR1,5
-    RETURN          ; No new byte, return to Main
-
-    ; Check if the received byte has a framing error
-    BTFSC RCSTA,2
-    GOTO RxFraming
-
-    ; Read the received byte and save it in rx_byte
-    MOVF RCREG,W
-    MOVWF rx_byte
-
-    ; Check if we are already working on a reply
-    MOVF reply_pending,F
-    BTFSS STATUS,2
-    RETURN          ; Ignore new data until the reply is prepared
-
-    ; Send the received byte to the packet parser
-    CALL ParseRxByte
+    ; Finish read diagnostic before display update
+    BANKSEL PORTA
+    BCF PORTA,1           ; RA1 LOW
     RETURN
 
-RxOverrun:
-    ; An overrun means the receiver was not read fast enough
-    BCF RCSTA,4      ; Turn the receiver OFF
-    BSF RCSTA,4      ; Turn the receiver back ON
-    MOVLW 0x04       ; 4 means an overrun error
-    GOTO RxError
+WriteEEPROM:
+    ; Begin write timing diagnostic
+    BANKSEL PORTA
+    BSF PORTA,2           ; RA2 HIGH
 
-RxFraming:
-    ; A framing error means the received byte was not valid
-    MOVF RCREG,W     ; Read and discard the bad byte
-    MOVLW 0x03       ; 3 means a framing error
+    ; Copy the pending selection into EEDAT
+    BANKSEL selected_value
+    MOVF selected_value,W
+    BANKSEL EEDAT
+    MOVWF EEDAT
 
-RxError:
-    ; Save the error so we can send a response later
-    MOVWF reply_pending
+    ; Set EEPROM destination address
+    BANKSEL EEADR
+    MOVLW DATA_EE_ADDR
+    MOVWF EEADR
 
-    ; Reset the packet parser so we wait for a new '$'
-    CLRF rx_state
+    ; Enable writing to data EEPROM
+    BANKSEL EECON1
+    BCF EECON1,7          ; EEPGD = 0
+    BSF EECON1,2          ; WREN = 1
 
-    ; Reset the ADC state in case a conversion was started
-    CLRF adc_state
+    ; Protect the EEPROM write-unlock sequence
+    BCF INTCON,7          ; Global interrupts OFF
+
+WaitGIEOff:
+    BTFSC INTCON,7
+    GOTO WaitGIEOff
+
+    ; Required EEPROM unlock sequence
+    MOVLW 0x55
+    MOVWF EECON2
+    MOVLW 0xAA
+    MOVWF EECON2
+    BSF EECON1,1          ; WR = 1, start writing
+
+WaitForWrite:
+    ; Wait for the EEPROM write to finish
+    BTFSC EECON1,1
+    GOTO WaitForWrite
+
+    ; Disable further EEPROM writes
+    BCF EECON1,2          ; WREN = 0
+
+    ; Clear the EEPROM write-complete flag
+    BANKSEL PIR2
+    BCF PIR2,4            ; EEIF = 0
+
+    ; End write diagnostic
+    BANKSEL PORTA
+    BCF PORTA,2           ; RA2 LOW
     RETURN
 
-ParseRxByte:
-    ; Check if we are waiting for the start byte
-    MOVF rx_state,F
-    BTFSC STATUS,2
-    GOTO WaitStart
-
-    ; Check if we are waiting for the command byte
-    MOVF rx_state,W
-    XORLW 0x01
-    BTFSC STATUS,2
-    GOTO GetCommand
-
-    ; Check if we are waiting for the length byte
-    MOVF rx_state,W
-    XORLW 0x02
-    BTFSC STATUS,2
-    GOTO GetLength
-
-    ; Check if we are waiting for the channel byte
-    MOVF rx_state,W
-    XORLW 0x03
-    BTFSC STATUS,2
-    GOTO GetChannel
-    
-    MOVF rx_state,W
-    XORLW 0x04
-    BTFSC STATUS,2
-    GOTO GetServoHigh
-
-    MOVF rx_state,W
-    XORLW 0x05
-    BTFSC STATUS,2
-    GOTO GetServoLow
-
-    ; If the state is not valid, restart the packet
-    GOTO ResetParser
-
-WaitStart:
-    ; Every packet should begin with '$' (0x24)
-    MOVF rx_byte,W
-    XORLW 0x24
-    BTFSS STATUS,2
-    RETURN          ; Not '$', keep waiting
-
-    ; Start byte found, move to command state
-    MOVLW 0x01
-    MOVWF rx_state
-    RETURN
-
-GetCommand:
-    MOVF rx_byte,W
-    XORLW 0x49       ; 'I'
-    BTFSC STATUS,2
-    GOTO SaveCommand
-
-    MOVF rx_byte,W
-    XORLW 0x53       ; 'S'
-    BTFSC STATUS,2
-    GOTO SaveCommand
-
-    MOVF rx_byte,W
-    XORLW 0x41       ; 'A'
-    BTFSS STATUS,2
-    GOTO ResetParser
-
-SaveCommand:
-    ; Save the command so we know what was requested
-    MOVF rx_byte,W
-    MOVWF rx_command
-
-    ; Move to the packet length state
-    MOVLW 0x02
-    MOVWF rx_state
-    RETURN
-
-GetLength:
-    MOVF rx_command,W
-    XORLW 0x49           ; 'I'
-    BTFSC STATUS,2
-    GOTO IDLength
-
-    MOVF rx_command,W
-    XORLW 0x53           ; 'S'
-    BTFSC STATUS,2
-    GOTO ServoLength
-
-    ; 'A' request: length must be 1
-    MOVF rx_byte,W
-    XORLW 0x01
-    BTFSS STATUS,2
-    GOTO ResetParser
-
-    MOVLW 0x03
-    MOVWF rx_state
-    RETURN
-
-IDLength:
-    ; ID requests only have 3 bytes, so the packet is done
-    CLRF rx_state
-
-    ; The ID request must have a data length of 0
-    MOVF rx_byte,F
-    BTFSS STATUS,2
-    RETURN          ; Wrong length, ignore request
-
-    ; Request a Device ID response
-    MOVLW 0x01
-    MOVWF reply_pending
-    RETURN
-
-GetChannel:
-    ; The last byte of the request has been received
-    CLRF rx_state
-
-    ; We only support channel AN0, which is 0x00
-    MOVF rx_byte,F
-    BTFSS STATUS,2
-    RETURN          ; Wrong channel, ignore request
-
-    ; Reset ADC state before starting a new reading
-    CLRF adc_state
-
-    ; Request an ADC response
-    MOVLW 0x02
-    MOVWF reply_pending
-    RETURN
-    
-ServoLength:
-    MOVF rx_byte,W
-    XORLW 0x02           ; S length must be 2
-    BTFSS STATUS,2
-    GOTO ResetParser
-
-    MOVLW 0x04
-    MOVWF rx_state       ; Next byte is high compare byte
-    RETURN
-
-GetServoHigh:
-    MOVF rx_byte,W
-    MOVWF servo_rx_h     ; Save the first compare byte
-
-    MOVLW 0x05
-    MOVWF rx_state       ; Next byte is low compare byte
-    RETURN
-
-GetServoLow:
-    MOVF rx_byte,W
-    MOVWF servo_rx_l     ; Save the second compare byte
-    CLRF rx_state        ; Entire S packet received
-
-    CALL CheckServo      ; Make sure compare value is allowed
-    RETURN
-
-ResetParser:
-    ; Go back to waiting for the '$' start byte
-    CLRF rx_state
-    RETURN
-    
-CheckServo:
-    ; Check high byte is not below 0xB3
-    MOVLW 0xB3
-    SUBWF servo_rx_h,W   ; W = high - 0xB3
-    BTFSS STATUS,0      ; C=0 means value is smaller
-    GOTO InvalidServo
-
-    MOVF servo_rx_h,W
-    XORLW 0xB3
-    BTFSC STATUS,2
-    GOTO CheckMinLow     ; At minimum high byte, check low
-
-    ; Check high byte is no greater than 0xBB
-    MOVLW 0xBB
-    SUBWF servo_rx_h,W
-    BTFSS STATUS,0
-    GOTO SaveServo       ; 0xB4..0xBA is allowed
-    MOVF servo_rx_h,W
-    XORLW 0xBB
-    BTFSS STATUS,2
-    GOTO InvalidServo    ; Above 0xBB
-
-    ; 0xBBxx needs a low byte no greater than 0xA4
-    MOVF servo_rx_l,W
-    SUBLW 0xA4           ; 0xA4 - low byte
-    BTFSS STATUS,0
-    GOTO InvalidServo
-    GOTO SaveServo
-
-CheckMinLow:
-    ; 0xB3xx needs a low byte at least 0xD4
-    MOVLW 0xD4
-    SUBWF servo_rx_l,W
-    BTFSS STATUS,0
-    GOTO InvalidServo
-
-SaveServo:
-    ; Disable interrupts only while saving both bytes together
-    BCF INTCON,7
-    MOVF servo_rx_h,W
-    MOVWF servo_next_h
-    MOVF servo_rx_l,W
-    MOVWF servo_next_l
-    BSF INTCON,7         ; Re-enable interrupts
-    RETURN               ; Valid S command has NO response
-
-InvalidServo:
-    MOVLW 0x05           ; Use reply 5 for servo range error
-    MOVWF reply_pending
-    RETURN               ; Previous valid compare value stays saved
-
-ServiceReply:
-    ; Prepare an ID, ADC, or error response
-    BANKSEL reply_pending
-
-    ; Check if a response needs to be sent
-    MOVF reply_pending,F
-    BTFSC STATUS,2
-    RETURN          ; No reply needed
-
-    ; Check if the previous packet has finished being queued
-    MOVF tx_length,W
-    XORWF tx_count,W
-    BTFSS STATUS,2
-    RETURN          ; Still sending the previous packet
-
-    ; Check if we need to send the Device ID
-    MOVF reply_pending,W
-    XORLW 0x01
-    BTFSC STATUS,2
-    GOTO BuildID
-
-    ; Check if we need to send an ADC reading
-    MOVF reply_pending,W
-    XORLW 0x02
-    BTFSC STATUS,2
-    GOTO BuildADC
-
-    ; Otherwise we need to send an error response
-    GOTO BuildError
-
-BuildID:
-    ; Device ID packet: 24 49 02 33 75
-    MOVLW 0x49       ; 'I' means Device ID
-    MOVWF tx_data1
-    MOVLW 0x02       ; Two data bytes
-    MOVWF tx_data2
-
-    ; Our Device ID is 0x3375
-    MOVLW 0x33       ; High byte of ID
-    MOVWF tx_data3
-    MOVLW 0x75       ; Low byte of ID
-    MOVWF tx_data4
-
-    ; Five bytes total in the response
-    MOVLW 0x05
-    GOTO FinishPacket
-
-BuildADC:
-    ; First we need to get an ADC reading
-    CALL ServiceAdc
-
-    ; Check if the ADC conversion is finished
-    BANKSEL adc_state
-    MOVF adc_state,W
-    XORLW 0x02
-    BTFSS STATUS,2
-    RETURN          ; Not ready yet, try again next loop
-
-    ; ADC packet: 24 41 03 00 HH LL
-    MOVLW 0x41       ; 'A' means ADC response
-    MOVWF tx_data1
-    MOVLW 0x03       ; Three data bytes
-    MOVWF tx_data2
-    CLRF tx_data3    ; Channel number is AN0 (0)
-
-    ; Put the high and low ADC bytes into the packet
-    MOVF adc_high,W
-    MOVWF tx_data4
-    MOVF adc_low,W
-    MOVWF tx_data5
-
-    ; Reset ADC state for the next reading
-    CLRF adc_state
-
-    ; Six bytes total in the response
-    MOVLW 0x06
-    GOTO FinishPacket
-
-BuildError:
-    MOVLW 0x45           ; 'E'
-    MOVWF tx_data1
-    MOVLW 0x02
-    MOVWF tx_data2
-
-    ; internal 3,4,5 -> packet code 1,2,3
-    MOVLW 0x02
-    SUBWF reply_pending,W
-    MOVWF tx_data3
-
-    ; detail = 1 only for the servo range error
-    CLRF tx_data4
-    MOVF reply_pending,W
-    XORLW 0x05
-    BTFSC STATUS,2
-    INCF tx_data4,F
-
-    MOVLW 0x05
-    GOTO FinishPacket
-
-FinishPacket:
-    ; W already contains the total packet length
-    MOVWF tx_length
-
-    ; Every response starts with '$' (0x24)
-    MOVLW 0x24
-    MOVWF tx_data0
-
-    ; Start transmitting from the first byte
-    CLRF tx_count
-
-    ; Clear the reply flag because the packet is ready
-    CLRF reply_pending
-    RETURN
-
-ServiceAdc:
-    BANKSEL adc_state
-
-    ; adc_state = 0 means the ADC is not running
-    MOVF adc_state,F
-    BTFSC STATUS,2
-    GOTO StartAdc
-
-    ; adc_state = 1 means a conversion is running
-    MOVF adc_state,W
-    XORLW 0x01
-    BTFSS STATUS,2
-    RETURN          ; Already finished or invalid state
-
-    ; Check the GO/DONE bit to see if ADC is finished
-    BTFSC ADCON0,1
-    RETURN          ; Conversion is still running
-
-    ; Read the high byte of the ADC result
-    MOVF ADRESH,W
-    MOVWF adc_high
-
-    ; ADRESL is in bank 1, so switch banks
-    BANKSEL ADRESL
-    MOVF ADRESL,W
-
-    ; Go back to bank 0 and save the low byte
-    BANKSEL adc_low
-    MOVWF adc_low
-
-    ; Set adc_state to 2 to show the result is ready
-    MOVLW 0x02
-    MOVWF adc_state
-    RETURN
-
-StartAdc:
-    ; Start a new ADC conversion on AN0
-    BSF ADCON0,1     ; Set GO/DONE to start conversion
-
-    ; Set adc_state to 1 because ADC is now busy
-    MOVLW 0x01
-    MOVWF adc_state
-    RETURN
-
-ServiceTx:
-    ; Our packet buffer and UART registers are in bank 0
-    BANKSEL tx_count
-
-    ; Check if all packet bytes have been sent
-    MOVF tx_length,W
-    XORWF tx_count,W
-    BTFSC STATUS,2
-    RETURN          ; All bytes have been queued
-
-    ; Check if TXREG is ready for another byte
-    BTFSS PIR1,4
-    RETURN          ; Transmit register is still full
-
-    ; Find the next byte in our transmit buffer
-    MOVF tx_count,W
-    ADDLW tx_data0
-    MOVWF FSR
-
-    ; Make sure indirect addressing uses bank 0/1
-    BCF STATUS,7   ; IRP = 0
-    MOVF INDF,W	   ; INDF reads the byte at the address stored in FSR
-    MOVWF TXREG    ; Send that byte through the UART
-
-    ; Increase the counter to point to the next byte
-    INCF tx_count,F
-    RETURN
-    
-ISRHandler:
-   ; Save W and STATUS before changing anything in interrupt
-    MOVWF W_TEMP
-    SWAPF STATUS,W
-    MOVWF STATUS_TEMP
-
-    ; Check Timer1 overflow interrupt first.
-    BANKSEL PIR1
-    BTFSC PIR1,0      ; Did Timer1 overflow?
-    GOTO Timer1ISR
-
-    ; Check CCP1 compare interrupt.
-    BTFSC PIR1,2      ; Did Timer1 match CCPR1?
-    GOTO CCP1ISR
-    GOTO LeaveISR
-    
-Timer1ISR:
-    ; Timer1 overflow: begin a new 20 ms servo frame
-    BANKSEL PIR1
-    BCF PIR1,0       ; Clear Timer1 interrupt flag
-    BCF PIR1,2       ; Clear any old CCP1 match flag
-
-    ; Copy the saved command to the CCP compare hardware
-    BANKSEL servo_next_h
-    MOVF servo_next_h,W
-    BANKSEL CCPR1H
-    MOVWF CCPR1H
-
-    BANKSEL servo_next_l
-    MOVF servo_next_l,W
-    BANKSEL CCPR1L
-    MOVWF CCPR1L
-
-    ; Reload Timer1; compare target is relative to 0xB1E0
-    BANKSEL TMR1H
-    MOVLW 0xB1
-    MOVWF TMR1H
-    MOVLW 0xE0
-    MOVWF TMR1L
-
-    ; Start the servo HIGH pulse
+DisplayChar:
+    ; DLG7137 Display 
+    ANDLW 0x7F            ; Keep the seven ASCII data bits
+    IORLW 0x80            ; Keep RC7 Write HIGH
     BANKSEL PORTC
-    BSF PORTC,2
-    BANKSEL servo_busy
-    MOVLW 0x01
-    MOVWF servo_busy
+    MOVWF PORTC           ; Put character on the data pins
+    NOP                   ; Allow data to settle
+    BCF PORTC,7           ; Pulse display Write LOW
+    NOP			  ; Allow data to settle
+    BSF PORTC,7           ; Finish the display write
+    RETURN
 
-    ; Allow the CCP match to end this pulse
-    BANKSEL PIE1
-    BSF PIE1,2       ; Enable CCP1 interrupt
-    Goto LeaveISR
-
-CCP1ISR:
-    ; CCP match: end the servo pulse
-    BANKSEL PIR1
-    BCF PIR1,2       ; Clear CCP1 interrupt flag
-    BANKSEL PORTC
-    BCF PORTC,2      ; Bring RC2 LOW
-    BANKSEL servo_busy
-    CLRF servo_busy  ; Safe to service foreground again
-    BANKSEL PIE1
-    BCF PIE1,2       ; Disable CCP1 until next frame
-    Goto LeaveISR
+Delay10ms:
+    CALL Delay5ms
+    CALL Delay5ms
     
-    LeaveISR:
-    ; Restore STATUS and W register
-    SWAPF STATUS_TEMP,W
-    MOVWF STATUS
-    SWAPF W_TEMP,F
-    SWAPF W_TEMP,W
-    RETFIE
-
+ Delay5ms:
+    MOVLW   0x5E
+    MOVWF   Count5ms
+    
+Delay5msLoop:
+    Call    Delay50usLoop
+    DECFSZ  Count5ms
+    GOTO    Delay5msLoop
+    MOVLW   0x04
+    MOVWF   Count5ms
+    DECFSZ  Count5ms
+    GOTO    $-1
+    RETURN
+    
+Delay50usLoop:
+    ;Delay loop is equals 44 Tcy when count is 15
+    MOVLW 0x0F             ;1 Tcy move W=15 to count
+    MOVWF Count50us        ;1 Tcy make count equal 15                                    
+    DECFSZ Count50us,1     ;1 Tcy if not zero, 2 Tcy if zero
+    GOTO $-1               ;2 Tcy delay runs 15 times before skiping
+    RETURN
+    
 END
