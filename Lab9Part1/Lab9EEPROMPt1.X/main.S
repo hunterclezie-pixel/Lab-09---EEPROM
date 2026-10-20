@@ -30,8 +30,8 @@
     stored_value   EQU 0x21 ; Value read from EEPROM
     write_down     EQU 0x22 ; 1 when Write button is held
     select_down    EQU 0x23 ; 1 when Select button is held
-    delay_outer    EQU 0x24 ; Outer debounce delay counter
-    delay_inner    EQU 0x25 ; Inner debounce delay counter
+    Count5ms	   EQU 0x24 ; Outer debounce delay counter
+    Count50us    EQU 0x25 ; Inner debounce delay counter
 
     ; EEPROM address
     DATA_EE_ADDR   EQU 0x00 ; Store our character at address 0
@@ -90,11 +90,12 @@ Setup:
     CLRF write_down
     CLRF select_down
 
+    WaitStartupRelease:
     ; Wait until Write button is released
     BANKSEL PORTB
     BTFSS PORTB,1
     GOTO WaitStartupRelease
-    CALL Delay10ms  ; Debounce release
+    CALL Delay10ms       ; Debounce release
     BANKSEL PORTB
     BTFSS PORTB,1
     GOTO WaitStartupRelease
@@ -176,7 +177,7 @@ WriteReleased:
     RETURN               ; Bounce, not a valid release
 
     BANKSEL write_down
-    BCF write_down,0      ; End selection mode
+    BCF write_down,0     ; End selection mode
 
     ; One completed press-and-release cycle
     CALL WriteEEPROM     ; Write exactly once
@@ -204,7 +205,7 @@ CheckSelect:
     BTFSS write_down,0
     RETURN
 
-    ; Check if the current selection is A
+    ; Check if the current selection is "A"
     MOVF selected_value,W
     XORLW 0x41
     BTFSC STATUS,2
@@ -248,8 +249,8 @@ ReadEEPROM:
     BSF EECON1,0          ; RD = 1
 
     ; Read the saved data into RAM
-    BANKSEL EEDAT
-    MOVF EEDAT,W
+    BANKSEL EEDATA
+    MOVF EEDATA,W
     BANKSEL stored_value
     MOVWF stored_value
 
@@ -259,15 +260,11 @@ ReadEEPROM:
     RETURN
 
 WriteEEPROM:
-    ; Begin write timing diagnostic
-    BANKSEL PORTA
-    BSF PORTA,2           ; RA2 HIGH
-
     ; Copy the pending selection into EEDAT
     BANKSEL selected_value
     MOVF selected_value,W
-    BANKSEL EEDAT
-    MOVWF EEDAT
+    BANKSEL EEDATA
+    MOVWF EEDATA
 
     ; Set EEPROM destination address
     BANKSEL EEADR
@@ -291,10 +288,15 @@ WaitGIEOff:
     MOVWF EECON2
     MOVLW 0xAA
     MOVWF EECON2
-    BSF EECON1,1          ; WR = 1, start writing
+    BSF EECON1,1          ; Start EEPROM write
 
+    ; Start write diagnostic
+    BANKSEL PORTA
+    BSF PORTA,2           ; RA2 HIGH while writing
+    
 WaitForWrite:
     ; Wait for the EEPROM write to finish
+    BANKSEL EECON1
     BTFSC EECON1,1
     GOTO WaitForWrite
 
@@ -325,6 +327,7 @@ DisplayChar:
 Delay10ms:
     CALL Delay5ms
     CALL Delay5ms
+    RETURN
     
  Delay5ms:
     MOVLW   0x5E
