@@ -66,7 +66,7 @@ PSECT isrVect,class=CODE,delta=2
 PSECT code,class=CODE,delta=2
 
 Setup:
-    ; ---- Bank 0: set output latches BEFORE the pins become outputs ----
+    ; Bank 0: set output latches BEFORE the pins become outputs
     BANKSEL PORTA
     BCF PORTA,0     ; Selection LED OFF
     BCF PORTA,1     ; Main-loop diagnostic LOW
@@ -74,14 +74,14 @@ Setup:
     MOVLW 0x80
     MOVWF PORTC     ; Display Write HIGH
  
-    ; ---- Bank 3 ----
+    ; Bank 3
     BANKSEL ANSEL
     CLRF ANSEL      ; Disable analog inputs
     CLRF ANSELH
     BCF EECON1,7    ; Select data EEPROM
     BCF EECON1,2    ; Disable EEPROM writing
  
-    ; ---- Bank 1 ----
+    ; Bank 1
     BANKSEL TRISA
     BCF TRISA,0     ; RA0 selection LED output
     BCF TRISA,1     ; RA1 main-loop diagnostic output
@@ -94,7 +94,7 @@ Setup:
     MOVLW 0x07
     MOVWF OPTION_REG ; RBPU=0 (pull-ups on), internal clock, 1:256 prescaler
  
-    ; ---- Bank 0 ----
+    ; Bank 0
     BANKSEL TMR0
     CLRF TMR0           ; Clear Timer0 counter
     BCF INTCON,2        ; Clear Timer0 overflow flag
@@ -135,7 +135,7 @@ Main:
     BTFSC PIR2,4
     CALL EEPROMVerifyWrite
  
-UpdateErrorLED:
+ UpdateErrorLED:
     ; RA2 follows EEPROM_ERROR on each loop
     BANKSEL PORTA        ; EEPROMVerifyWrite may have changed banks
     BTFSS ee_status,EEPROM_ERROR
@@ -416,6 +416,7 @@ EEPROMVerifyWrite:
  
     ; Compare with the expected ee_data (ee_data is not changed)
     BANKSEL ee_data
+    ; MOVLW 0xFF           ; Testing Error
     XORWF ee_data,W
     BTFSC STATUS,2
     GOTO VerifySuccess
