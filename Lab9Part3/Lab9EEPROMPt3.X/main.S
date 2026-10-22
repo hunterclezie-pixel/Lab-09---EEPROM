@@ -99,7 +99,7 @@ Setup:
     BCF TRISA,1     ; RA1 buzzer output
     BCF TRISA,2     ; RA2 unused output
     MOVLW 0xFF
-    MOVWF TRISB     ; Rows RB0-RB3 output, columns RB4-RB7 input
+    MOVWF TRISB     ; RB0-RB7 start as inputs
     CLRF TRISC      ; Display outputs
     MOVLW 0xFF
     MOVWF WPUB      ; Weak pull-ups on keypad columns
@@ -134,7 +134,8 @@ Setup:
     MOVWF key_code
     BCF STATUS,7     ; IRP = 0: indirect addressing uses bank 0/1
  
-    ; Begin in the locked state
+    ; Begin in the locked state and initialize pin
+    CALL InitializePIN
     MOVLW 0x4C       ; 'L' = locked
     CALL DisplayChar
     
@@ -167,7 +168,7 @@ Main:
     CALL BeepKey     ; All 16 keys produce a beep
     CALL HandleKey   ; Process the new key
     GOTO Main
- 
+   
 KeyReleased:
     ; Wait for a stable release before accepting another press
     BTFSS key_held,0
@@ -264,149 +265,110 @@ ScanKey:
     BANKSEL keyLow
  
 ; Pick one key if several are pressed (D = highest priority)
-; The number loaded is the key index used by KeyTable
+; Store the actual key value instead of using KeyTable
 Test_D:
     BTFSS keyHigh,7  ; Test if D is pressed
-    GOTO Test_Hash   ; If not, moves to the next priority
-    MOVLW 15
+    GOTO Test_Hash
+    MOVLW 0x0F
     GOTO SaveKeyIndex
- 
+
 Test_Hash:
     BTFSS keyHigh,6  ; Test if # is pressed
     GOTO Test_0
-    MOVLW 14
+    MOVLW HASH_KEY
     GOTO SaveKeyIndex
- 
+
 Test_0:
     BTFSS keyHigh,5  ; Test if 0 is pressed
     GOTO Test_Star
-    MOVLW 13
+    MOVLW 0x00
     GOTO SaveKeyIndex
- 
+
 Test_Star:
     BTFSS keyHigh,4  ; Test if * is pressed
     GOTO Test_C
-    MOVLW 12
+    MOVLW STAR_KEY
     GOTO SaveKeyIndex
- 
+
 Test_C:
     BTFSS keyHigh,3  ; Test if C is pressed
     GOTO Test_9
-    MOVLW 11
+    MOVLW 0x0E
     GOTO SaveKeyIndex
- 
+
 Test_9:
     BTFSS keyHigh,2  ; Test if 9 is pressed
     GOTO Test_8
-    MOVLW 10
+    MOVLW 0x09
     GOTO SaveKeyIndex
- 
+
 Test_8:
     BTFSS keyHigh,1  ; Test if 8 is pressed
     GOTO Test_7
-    MOVLW 9
+    MOVLW 0x08
     GOTO SaveKeyIndex
- 
+
 Test_7:
     BTFSS keyHigh,0  ; Test if 7 is pressed
     GOTO Test_B
-    MOVLW 8
+    MOVLW 0x07
     GOTO SaveKeyIndex
- 
+
 Test_B:
     BTFSS keyLow,7   ; Test if B is pressed
     GOTO Test_6
-    MOVLW 7
+    MOVLW 0x0D
     GOTO SaveKeyIndex
- 
+
 Test_6:
     BTFSS keyLow,6   ; Test if 6 is pressed
     GOTO Test_5
-    MOVLW 6
+    MOVLW 0x06
     GOTO SaveKeyIndex
- 
+
 Test_5:
     BTFSS keyLow,5   ; Test if 5 is pressed
     GOTO Test_4
-    MOVLW 5
+    MOVLW 0x05
     GOTO SaveKeyIndex
- 
+
 Test_4:
     BTFSS keyLow,4   ; Test if 4 is pressed
     GOTO Test_A
-    MOVLW 4
+    MOVLW 0x04
     GOTO SaveKeyIndex
- 
+
 Test_A:
     BTFSS keyLow,3   ; Test if A is pressed
     GOTO Test_3
-    MOVLW 3
+    MOVLW 0x0C
     GOTO SaveKeyIndex
- 
+
 Test_3:
     BTFSS keyLow,2   ; Test if 3 is pressed
     GOTO Test_2
-    MOVLW 2
+    MOVLW 0x03
     GOTO SaveKeyIndex
- 
+
 Test_2:
     BTFSS keyLow,1   ; Test if 2 is pressed
     GOTO Test_1
-    MOVLW 1
+    MOVLW 0x02
     GOTO SaveKeyIndex
- 
+
 Test_1:
     BTFSS keyLow,0   ; Test if 1 is pressed
     GOTO NoKey
-    MOVLW 0
+    MOVLW 0x01
     GOTO SaveKeyIndex
- 
-NoKey:                
+
+NoKey:
     MOVLW NO_KEY     ; No key active
- 
+
 SaveKeyIndex:
-    BANKSEL key_index
-    MOVWF key_index  ; Save the detected key position
-
-    ; Check if no key was pressed
-    MOVLW NO_KEY
-    XORWF key_index,W
-    BTFSC STATUS,2
-    GOTO NoKeyFound
-
-    ; Convert the key position into its actual value
-    MOVF key_index,W
-    CALL KeyTable
-
-    ; Save the converted key
     BANKSEL key_code
-    MOVWF key_code
+    MOVWF key_code   ; Save the actual key value
     RETURN
-
-NoKeyFound:
-    BANKSEL key_code
-    MOVLW NO_KEY
-    MOVWF key_code   ; Tell Main no key was pressed
-    RETURN
-    
-KeyTable:
-    ADDWF PCL,F      ; Add key index to the program counter
-    RETLW 0x01       ; 0  - Key 1
-    RETLW 0x02       ; 1  - Key 2
-    RETLW 0x03       ; 2  - Key 3
-    RETLW 0x0C       ; 3  - Key A
-    RETLW 0x04       ; 4  - Key 4
-    RETLW 0x05       ; 5  - Key 5
-    RETLW 0x06       ; 6  - Key 6
-    RETLW 0x0D       ; 7  - Key B
-    RETLW 0x07       ; 8  - Key 7
-    RETLW 0x08       ; 9  - Key 8
-    RETLW 0x09       ; 10 - Key 9
-    RETLW 0x0E       ; 11 - Key C
-    RETLW STAR_KEY   ; 12 - Key *
-    RETLW 0x00       ; 13 - Key 0
-    RETLW HASH_KEY   ; 14 - Key #
-    RETLW 0x0F       ; 15 - Key D
  
 ; Handle one debounced keypad press
 HandleKey:
