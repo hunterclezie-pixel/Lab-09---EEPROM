@@ -1,6 +1,6 @@
 // Hunter Clezie
 // RCET3375
-// Lab9EEPROMPt2
+// Lab9EEPROMPt3
 // https://github.com/hunterclezie-pixel/Lab-09---EEPROM.git
 
 ; PIC16F883 Configuration Bit Settings
@@ -26,10 +26,10 @@
 ; config statements should precede project file includes.
 #include <xc.inc>  
     ; General Purpose Registers
-    selected_value EQU 0x20 ; Pending RAM selection: A or B
-    stored_value   EQU 0x21 ; Value read from EEPROM
-    write_down     EQU 0x22 ; 1 when Write button is held
-    select_down    EQU 0x23 ; 1 when Select button is held
+    pin_digit1     EQU 0x20 ; First entered PIN digit
+    pin_digit2     EQU 0x21 ; Second entered PIN digit
+    pin_digit3     EQU 0x22 ; Third entered PIN digit
+    pin_digit4     EQU 0x23 ; Fourth entered PIN digit
     Count5ms	   EQU 0x24 ; Outer debounce delay counter
     Count50us      EQU 0x25 ; Inner debounce delay counter
 
@@ -39,11 +39,22 @@
     ee_status      EQU 0x28  ; EEPROM status bits
     
     ; Additional application registers
-    selection_mode EQU 0x29  ; Bit 0 = selection mode active
-    timeout_tick   EQU 0x2A  ; Counts 20 Timer1 overflows
+    digit_count    EQU 0x29 ; Number of PIN digits entered
+    key_held       EQU 0x2A ; Bit 0 = key has been pressed
+    key_code       EQU 0x2B ; Scanned key (0-15, FF = none)
+    candidate_key  EQU 0x2C ; Key saved during debounce
+    keyLow         EQU 0x2D ; Key status bits for keys 1,2,3,A,4,5,6,B
+    key_index      EQU 0x2E ; Scanned key position (0-15, FF = none)
+    keyHigh        EQU 0x2F ; Key status bits for keys 7,8,9,C,*,0,#,D
+    beep_count     EQU 0x30 ; Buzzer delay counter
+    pulse_count    EQU 0x31 ; Timer0 overflow counter
+    entry_error    EQU 0x32 ; Bit 0 = fifth digit entered
+    pin_index      EQU 0x33 ; PIN comparison counter
 
     ; Constant (a number, NOT a register)
     TIMEOUT_OVERFLOWS EQU 15 ; 15 x 65.536 ms = about 1 second
+    PIN_EE_START   EQU 0x00
+    PIN_LENGTH     EQU 0x04
 
     ; EEPROM status bit positions
     EEPROM_READ    EQU 0
@@ -51,8 +62,10 @@
     EEPROM_ERROR   EQU 2
     GIE_SAVED      EQU 3     ; Temporarily save GIE during unlock
       
-    ; EEPROM address
-    DATA_EE_ADDR   EQU 0x00  ; Store our character at address 0
+; Special keypad codes
+    NO_KEY         EQU 0xFF
+    STAR_KEY       EQU 0x0A
+    HASH_KEY       EQU 0x0B
  
 ; Reset Vector at 0000h. Execution starts here after reset.
 PSECT resetVect,class=CODE,delta=2
@@ -66,11 +79,10 @@ PSECT isrVect,class=CODE,delta=2
 PSECT code,class=CODE,delta=2
 
 Setup:
-    ; Bank 0: set output latches BEFORE the pins become outputs
+    ; Bank 0: Outputs OFF before the pins become outputs
     BANKSEL PORTA
-    BCF PORTA,0     ; Selection LED OFF
-    BCF PORTA,1     ; Main-loop diagnostic LOW
-    BCF PORTA,2     ; Error LED OFF
+    CLRF PORTA      ; Solenoid and buzzer OFF
+    CLRF PORTB      ; Keep keypad rows LOW
     MOVLW 0x80
     MOVWF PORTC     ; Display Write HIGH
  
@@ -83,245 +95,472 @@ Setup:
  
     ; Bank 1
     BANKSEL TRISA
-    BCF TRISA,0     ; RA0 selection LED output
-    BCF TRISA,1     ; RA1 main-loop diagnostic output
-    BCF TRISA,2     ; RA2 error LED output
-    BSF TRISB,0     ; RB0 Select button
-    BSF TRISB,1     ; RB1 Write button
-    CLRF TRISC      ; PORTC display outputs
-    MOVLW 0x03
-    MOVWF WPUB      ; Enable RB0 and RB1 pull-ups
+    BCF TRISA,0     ; RA0 simulated solenoid output
+    BCF TRISA,1     ; RA1 buzzer output
+    BCF TRISA,2     ; RA2 unused output
+    MOVLW 0xFF
+    MOVWF TRISB     ; Rows RB0-RB3 output, columns RB4-RB7 input
+    CLRF TRISC      ; Display outputs
+    MOVLW 0xFF
+    MOVWF WPUB      ; Weak pull-ups on keypad columns
     MOVLW 0x07
     MOVWF OPTION_REG ; RBPU=0 (pull-ups on), internal clock, 1:256 prescaler
  
     ; Bank 0
     BANKSEL TMR0
-    CLRF TMR0           ; Clear Timer0 counter
-    BCF INTCON,2        ; Clear Timer0 overflow flag
+    CLRF TMR0        ; Clear Timer0 counter
+    BCF INTCON,2     ; Clear Timer0 overflow flag
+    BCF INTCON,7     ; Leave global interrupts disabled
  
-    ; Initialize GPRs
-    MOVLW 0x41
-    MOVWF selected_value ; Start selection at A
-    CLRF stored_value
-    CLRF write_down
-    CLRF select_down
+    ; Clear all application registers
+    CLRF pin_digit1
+    CLRF pin_digit2
+    CLRF pin_digit3
+    CLRF pin_digit4
+    CLRF digit_count
+    CLRF key_held
+    CLRF candidate_key
+    CLRF keyLow
+    CLRF key_index
+    CLRF keyHigh
+    CLRF beep_count
+    CLRF pulse_count
+    CLRF entry_error
+    CLRF pin_index
     CLRF ee_address
     CLRF ee_data
     CLRF ee_status
-    CLRF selection_mode
-    CLRF timeout_tick
+    MOVLW NO_KEY
+    MOVWF key_code
+    BCF STATUS,7     ; IRP = 0: indirect addressing uses bank 0/1
  
-WaitStartupRelease:
-    ; Wait until Write button is released
-    BANKSEL PORTB
-    BTFSS PORTB,1
-    GOTO WaitStartupRelease
-    CALL Delay10ms       ; Debounce release
-    BANKSEL PORTB
-    BTFSS PORTB,1
-    GOTO WaitStartupRelease
+    ; Begin in the locked state
+    MOVLW 0x4C       ; 'L' = locked
+    CALL DisplayChar
+    
+GOTO Main
  
 Main:
-    ; Application registers and ports are all in bank 0
-    BANKSEL PORTA
-    
-    ; Pulse RA1 once per main-loop iteration
-    BSF PORTA,1
-    BCF PORTA,1
- 
-    ; Poll for EEPROM write completion (EEIF = PIR2 bit 4)
-    BTFSS ee_status,EEPROM_WRITE
-    GOTO UpdateErrorLED
-    BTFSC PIR2,4
-    CALL EEPROMVerifyWrite
- 
- UpdateErrorLED:
-    ; RA2 follows EEPROM_ERROR on each loop
-    BANKSEL PORTA        ; EEPROMVerifyWrite may have changed banks
-    BTFSS ee_status,EEPROM_ERROR
-    BCF PORTA,2
-    BTFSC ee_status,EEPROM_ERROR
-    BSF PORTA,2
- 
-    ; Time out selection before accepting another button press
-    CALL CheckTimeout
- 
-    ; Ignore buttons (and leave the display alone) while EEPROM is busy
-    BANKSEL ee_status
-    BTFSC ee_status,EEPROM_READ
-    GOTO Main
-    BTFSC ee_status,EEPROM_WRITE
-    GOTO Main
-    CALL CheckSelect
-    CALL CheckWrite
- 
-    ; If a write just started, keep the last character displayed
-    BANKSEL ee_status
-    BTFSC ee_status,EEPROM_WRITE
-    GOTO Main
- 
-    ; Show pending A/B during selection
-    BTFSC selection_mode,0
-    GOTO ShowSelection
- 
-    ; Normal mode: read EEPROM address 0x00
-    MOVLW DATA_EE_ADDR
-    MOVWF ee_address
-    CALL EEPROMRead
-    BANKSEL ee_data
-    MOVF ee_data,W
-    MOVWF stored_value
- 
-    ; Display A or B if stored data matches
-    XORLW 0x41           ; W still holds the stored value
+    ; Check for a keypad press
+    CALL ScanKey
+    BANKSEL key_code
+    MOVLW NO_KEY
+    XORWF key_code,W
     BTFSC STATUS,2
-    GOTO ShowStored
-    MOVF stored_value,W
-    XORLW 0x42
-    BTFSC STATUS,2
-    GOTO ShowStored
+    GOTO KeyReleased
  
-    ; Unknown EEPROM byte displays '?'
-    MOVLW 0x3F
-    CALL DisplayChar
+    ; Ignore a key that is still being held
+    BTFSC key_held,0
     GOTO Main
  
-ShowStored:
-    MOVF stored_value,W
-    CALL DisplayChar
-    GOTO Main
- 
-ShowSelection:
-    ; Display the pending RAM selection
-    MOVF selected_value,W
-    CALL DisplayChar
-    GOTO Main
- 
-CheckTimeout:
-    BANKSEL selection_mode
-    ; Only count time while selecting
-    BTFSS selection_mode,0
-    RETURN
- 
-    ; Check for Timer0 overflow
-    BTFSS INTCON,2
-    RETURN
-    BCF INTCON,2         ; Clear overflow flag
- 
-    ; Count one Timer0 overflow
-    INCF timeout_tick,F
- 
-    ; Check if 15 overflows have occurred
-    MOVLW TIMEOUT_OVERFLOWS
-    XORWF timeout_tick,W
+    ; Debounce a new key press
+    MOVF key_code,W
+    MOVWF candidate_key
+    CALL Delay10ms
+    CALL ScanKey
+    BANKSEL candidate_key
+    MOVF candidate_key,W
+    XORWF key_code,W
     BTFSS STATUS,2
-    RETURN
+    GOTO Main        ; Not a stable press
+    BSF key_held,0   ; Count this press only once
+    CALL BeepKey     ; All 16 keys produce a beep
+    CALL HandleKey   ; Process the new key
+    GOTO Main
  
-    ; One second passed without a Select press
-    BCF selection_mode,0
-    BCF PORTA,0          ; Selection LED OFF
-    RETURN
+KeyReleased:
+    ; Wait for a stable release before accepting another press
+    BTFSS key_held,0
+    GOTO Main
+    CALL Delay10ms
+    CALL ScanKey
+    BANKSEL key_code
+    MOVLW NO_KEY
+    XORWF key_code,W
+    BTFSS STATUS,2
+    GOTO Main
+    BCF key_held,0
+    GOTO Main
+    
+ScanKey:
+    ; Determine which key is pressed on the 4x4 keypad
+    BANKSEL keyLow
+    CLRF keyLow      ; Clearing lower key status bits
+    CLRF keyHigh     ; Clearing higher key status bits
  
-RestartSelectionTimer:
-    ; Restart the one-second selection window
-    BANKSEL timeout_tick
-    CLRF timeout_tick
-    CLRF TMR0
-    BCF INTCON,2
+; Checks Row 4 of the 4x4 matrix
+    BANKSEL TRISB
+    MOVLW 0xF7       ; RB3 output LOW, rest of PORTB inputs
+    MOVWF TRISB
+    BANKSEL PORTB
+    NOP              ; Let the row settle
+    NOP
+ 
+; Checks each column 1-4
+    BTFSS PORTB,4    ; Column 1 for '*' key being pressed
+    BSF keyHigh,4
+    BTFSS PORTB,5    ; Column 2 for '0' key being pressed
+    BSF keyHigh,5
+    BTFSS PORTB,6    ; Column 3 for '#' key being pressed
+    BSF keyHigh,6
+    BTFSS PORTB,7    ; Column 4 for 'D' key being pressed
+    BSF keyHigh,7
+ 
+; Checks Row 3 of the 4x4 matrix
+    BANKSEL TRISB
+    MOVLW 0xFB       ; RB2 output LOW, rest of PORTB inputs
+    MOVWF TRISB
+    BANKSEL PORTB
+    NOP
+    NOP
+ 
+    BTFSS PORTB,4    ; Column 1 for '7' key being pressed
+    BSF keyHigh,0
+    BTFSS PORTB,5    ; Column 2 for '8' key being pressed
+    BSF keyHigh,1
+    BTFSS PORTB,6    ; Column 3 for '9' key being pressed
+    BSF keyHigh,2
+    BTFSS PORTB,7    ; Column 4 for 'C' key being pressed
+    BSF keyHigh,3
+ 
+; Checks Row 2 of the 4x4 matrix
+    BANKSEL TRISB
+    MOVLW 0xFD       ; RB1 output LOW, rest of PORTB inputs
+    MOVWF TRISB
+    BANKSEL PORTB
+    NOP
+    NOP
+ 
+    BTFSS PORTB,4    ; Column 1 for '4' key being pressed
+    BSF keyLow,4
+    BTFSS PORTB,5    ; Column 2 for '5' key being pressed
+    BSF keyLow,5
+    BTFSS PORTB,6    ; Column 3 for '6' key being pressed
+    BSF keyLow,6
+    BTFSS PORTB,7    ; Column 4 for 'B' key being pressed
+    BSF keyLow,7
+ 
+; Checks Row 1 of the 4x4 matrix
+    BANKSEL TRISB
+    MOVLW 0xFE       ; RB0 output LOW, rest of PORTB inputs
+    MOVWF TRISB
+    BANKSEL PORTB
+    NOP
+    NOP
+ 
+    BTFSS PORTB,4    ; Column 1 for '1' key being pressed
+    BSF keyLow,0
+    BTFSS PORTB,5    ; Column 2 for '2' key being pressed
+    BSF keyLow,1
+    BTFSS PORTB,6    ; Column 3 for '3' key being pressed
+    BSF keyLow,2
+    BTFSS PORTB,7    ; Column 4 for 'A' key being pressed
+    BSF keyLow,3
+ 
+; Release all rows (all of PORTB back to inputs)
+    BANKSEL TRISB
+    MOVLW 0xFF
+    MOVWF TRISB
+    BANKSEL keyLow
+ 
+; Pick one key if several are pressed (D = highest priority)
+; The number loaded is the key index used by KeyTable
+Test_D:
+    BTFSS keyHigh,7  ; Test if D is pressed
+    GOTO Test_Hash   ; If not, moves to the next priority
+    MOVLW 15
+    GOTO SaveKeyIndex
+ 
+Test_Hash:
+    BTFSS keyHigh,6  ; Test if # is pressed
+    GOTO Test_0
+    MOVLW 14
+    GOTO SaveKeyIndex
+ 
+Test_0:
+    BTFSS keyHigh,5  ; Test if 0 is pressed
+    GOTO Test_Star
+    MOVLW 13
+    GOTO SaveKeyIndex
+ 
+Test_Star:
+    BTFSS keyHigh,4  ; Test if * is pressed
+    GOTO Test_C
+    MOVLW 12
+    GOTO SaveKeyIndex
+ 
+Test_C:
+    BTFSS keyHigh,3  ; Test if C is pressed
+    GOTO Test_9
+    MOVLW 11
+    GOTO SaveKeyIndex
+ 
+Test_9:
+    BTFSS keyHigh,2  ; Test if 9 is pressed
+    GOTO Test_8
+    MOVLW 10
+    GOTO SaveKeyIndex
+ 
+Test_8:
+    BTFSS keyHigh,1  ; Test if 8 is pressed
+    GOTO Test_7
+    MOVLW 9
+    GOTO SaveKeyIndex
+ 
+Test_7:
+    BTFSS keyHigh,0  ; Test if 7 is pressed
+    GOTO Test_B
+    MOVLW 8
+    GOTO SaveKeyIndex
+ 
+Test_B:
+    BTFSS keyLow,7   ; Test if B is pressed
+    GOTO Test_6
+    MOVLW 7
+    GOTO SaveKeyIndex
+ 
+Test_6:
+    BTFSS keyLow,6   ; Test if 6 is pressed
+    GOTO Test_5
+    MOVLW 6
+    GOTO SaveKeyIndex
+ 
+Test_5:
+    BTFSS keyLow,5   ; Test if 5 is pressed
+    GOTO Test_4
+    MOVLW 5
+    GOTO SaveKeyIndex
+ 
+Test_4:
+    BTFSS keyLow,4   ; Test if 4 is pressed
+    GOTO Test_A
+    MOVLW 4
+    GOTO SaveKeyIndex
+ 
+Test_A:
+    BTFSS keyLow,3   ; Test if A is pressed
+    GOTO Test_3
+    MOVLW 3
+    GOTO SaveKeyIndex
+ 
+Test_3:
+    BTFSS keyLow,2   ; Test if 3 is pressed
+    GOTO Test_2
+    MOVLW 2
+    GOTO SaveKeyIndex
+ 
+Test_2:
+    BTFSS keyLow,1   ; Test if 2 is pressed
+    GOTO Test_1
+    MOVLW 1
+    GOTO SaveKeyIndex
+ 
+Test_1:
+    BTFSS keyLow,0   ; Test if 1 is pressed
+    GOTO NoKey
+    MOVLW 0
+    GOTO SaveKeyIndex
+ 
+NoKey:                
+    MOVLW NO_KEY     ; No key active
+ 
+SaveKeyIndex:
+    BANKSEL key_index
+    MOVWF key_index  ; Save the detected key position
+
+    ; Check if no key was pressed
+    MOVLW NO_KEY
+    XORWF key_index,W
+    BTFSC STATUS,2
+    GOTO NoKeyFound
+
+    ; Convert the key position into its actual value
+    MOVF key_index,W
+    CALL KeyTable
+
+    ; Save the converted key
+    BANKSEL key_code
+    MOVWF key_code
     RETURN
 
-CheckWrite:
-    BANKSEL PORTB
-    BTFSC PORTB,1        ; HIGH means released
-    GOTO WriteReleased
+NoKeyFound:
+    BANKSEL key_code
+    MOVLW NO_KEY
+    MOVWF key_code   ; Tell Main no key was pressed
+    RETURN
+    
+KeyTable:
+    ADDWF PCL,F      ; Add key index to the program counter
+    RETLW 0x01       ; 0  - Key 1
+    RETLW 0x02       ; 1  - Key 2
+    RETLW 0x03       ; 2  - Key 3
+    RETLW 0x0C       ; 3  - Key A
+    RETLW 0x04       ; 4  - Key 4
+    RETLW 0x05       ; 5  - Key 5
+    RETLW 0x06       ; 6  - Key 6
+    RETLW 0x0D       ; 7  - Key B
+    RETLW 0x07       ; 8  - Key 7
+    RETLW 0x08       ; 9  - Key 8
+    RETLW 0x09       ; 10 - Key 9
+    RETLW 0x0E       ; 11 - Key C
+    RETLW STAR_KEY   ; 12 - Key *
+    RETLW 0x00       ; 13 - Key 0
+    RETLW HASH_KEY   ; 14 - Key #
+    RETLW 0x0F       ; 15 - Key D
  
-    ; Button is physically LOW
-    BTFSC write_down,0
-    RETURN               ; Already registered as pressed
+; Handle one debounced keypad press
+HandleKey:
+    BANKSEL key_code
+    MOVLW STAR_KEY
+    XORWF key_code,W
+    BTFSC STATUS,2
+    GOTO CancelPIN
+    MOVLW HASH_KEY
+    XORWF key_code,W
+    BTFSC STATUS,2
+    GOTO SubmitPIN
  
-    ; Debounce the press
-    CALL Delay10ms
-    BANKSEL PORTB
-    BTFSC PORTB,1
-    RETURN               ; Invalid press
- 
-    BSF write_down,0     ; Remember valid press
- 
-    ; Only write during selection mode
-    BTFSS selection_mode,0
+    ; A-D do not change PIN entry
+    MOVLW 0x0A
+    SUBWF key_code,W    ; Carry=1 when key >= 10
+    BTFSC STATUS,0
     RETURN
  
-    ; Exit selection mode
-    BCF selection_mode,0
-    BCF PORTA,0          ; Selection LED OFF
+    ; Ignore digits after a fifth digit was already rejected
+    BTFSC entry_error,0
+    RETURN
  
-    ; Load the EEPROM address and the pending character
-    MOVLW DATA_EE_ADDR
+    ; Reject a fifth digit, even if first four were correct
+    MOVLW PIN_LENGTH
+    XORWF digit_count,W
+    BTFSC STATUS,2
+    GOTO TooManyDigits
+ 
+    ; Store the entered digit: FSR = pin_digit1 + digit_count
+    MOVF digit_count,W
+    ADDLW pin_digit1
+    MOVWF FSR
+    MOVF key_code,W
+    MOVWF INDF
+    INCF digit_count,F
+ 
+    ; Display how many digits have been entered (1-4)
+    MOVF digit_count,W
+    ADDLW 0x30           ; ASCII '1' through '4'
+    CALL DisplayChar
+    RETURN
+ 
+TooManyDigits:
+    BSF entry_error,0
+    MOVLW 0x45           ; 'E' = rejected entry
+    CALL DisplayChar
+    RETURN
+ 
+CancelPIN:
+    CALL ClearEntry
+    MOVLW 0x43           ; 'C' = canceled
+    CALL DisplayChar
+    RETURN
+ 
+SubmitPIN:
+    ; An invalid length or fifth digit must never unlock
+    BTFSC entry_error,0
+    GOTO RejectPIN
+    MOVLW PIN_LENGTH
+    XORWF digit_count,W
+    BTFSS STATUS,2
+    GOTO RejectPIN
+    CALL ComparePIN
+    CALL ClearEntry
+    RETURN
+ 
+RejectPIN:
+    CALL ClearEntry
+    MOVLW 0x45           ; 'E' = wrong/incomplete PIN
+    CALL DisplayChar
+    RETURN
+ 
+ClearEntry:
+    BANKSEL digit_count
+    CLRF digit_count
+    CLRF entry_error
+    CLRF pin_digit1
+    CLRF pin_digit2
+    CLRF pin_digit3
+    CLRF pin_digit4
+    RETURN
+ 
+ComparePIN:
+    ; Compare all four RAM digits with data EEPROM
+    BANKSEL pin_index
+    CLRF pin_index
+ 
+CompareNextDigit:
+    MOVF pin_index,W
+    ADDLW PIN_EE_START
     MOVWF ee_address
-    MOVF selected_value,W
-    MOVWF ee_data
+    CALL EEPROMRead       ; Part 2 routine, stored digit returns in ee_data
  
-    ; Start the write without waiting
-    CALL EEPROMWrite
+    BANKSEL pin_index     ; EEPROMRead changes banks
+    MOVF pin_index,W
+    ADDLW pin_digit1
+    MOVWF FSR
+    MOVF INDF,W          ; Entered digit
+    XORWF ee_data,W      ; Compare with stored EEPROM digit
+    BTFSS STATUS,2
+    GOTO WrongPIN
+    INCF pin_index,F
+    MOVLW PIN_LENGTH
+    XORWF pin_index,W
+    BTFSS STATUS,2
+    GOTO CompareNextDigit
+ 
+    ; All four digits matched
+    MOVLW 0x55           ; 'U' = unlocked
+    CALL DisplayChar
+    CALL SolenoidPulse
+    MOVLW 0x4C           ; 'L' = locked again
+    CALL DisplayChar
     RETURN
  
-WriteReleased:
-    BTFSS write_down,0
+WrongPIN:
+    MOVLW 0x45           ; 'E' = incorrect PIN
+    CALL DisplayChar
     RETURN
  
-    ; Debounce the release
+BeepKey:
+    ; Sound the active buzzer for about 150 ms
+    BANKSEL PORTA
+    BSF PORTA,1          ; Buzzer ON
+    MOVLW 0x0F
+    MOVWF beep_count     ; 15 x 10 ms
+ 
+BeepLoop:
     CALL Delay10ms
-    BANKSEL PORTB
-    BTFSS PORTB,1
-    RETURN
-    BCF write_down,0
-    RETURN
- 
-CheckSelect:
-    BANKSEL PORTB
-    BTFSC PORTB,0        ; HIGH means released
-    GOTO SelectReleased
- 
-    ; Button is physically LOW
-    BTFSC select_down,0
-    RETURN               ; Already registered as pressed
- 
-    ; Debounce the press
-    CALL Delay10ms
-    BANKSEL PORTB
-    BTFSC PORTB,0
-    RETURN               ; Invalid press
-    BSF select_down,0    ; Remember valid press
- 
-    ; Check if selection mode is already active
-    BTFSC selection_mode,0
-    GOTO ToggleSelection
- 
-    ; First Select press starts with A
-    BSF selection_mode,0
-    MOVLW 0x41
-    MOVWF selected_value
-    BSF PORTA,0          ; Selection LED ON
-    CALL RestartSelectionTimer
+    BANKSEL beep_count
+    DECFSZ beep_count,F
+    GOTO BeepLoop
+    BCF PORTA,1          ; Buzzer OFF
     RETURN
  
-ToggleSelection:
-    ; 'A' (0x41) XOR 0x03 = 'B' (0x42), and 'B' XOR 0x03 = 'A'
-    MOVLW 0x03
-    XORWF selected_value,F
-    CALL RestartSelectionTimer
-    RETURN
+SolenoidPulse:
+    ; Turn on the simulated solenoid for about one second
+    BANKSEL PORTA
+    BSF PORTA,0          ; Unlock output HIGH
+    CLRF pulse_count
+    CLRF TMR0
+    BCF INTCON,2
  
-SelectReleased:
-    BTFSS select_down,0
-    RETURN
- 
-    ; Debounce the release
-    CALL Delay10ms
-    BANKSEL PORTB
-    BTFSS PORTB,0
-    RETURN
-    BCF select_down,0
+SolenoidWait:
+    BTFSS INTCON,2
+    GOTO SolenoidWait
+    BCF INTCON,2
+    INCF pulse_count,F
+    MOVLW TIMEOUT_OVERFLOWS
+    XORWF pulse_count,W
+    BTFSS STATUS,2
+    GOTO SolenoidWait
+    BCF PORTA,0          ; Lock output LOW
     RETURN
 
 EEPROMFetch:
@@ -457,6 +696,7 @@ Delay10ms:
     RETURN
  
 Delay5ms:
+    BANKSEL Count5ms
     MOVLW   0x5E
     MOVWF   Count5ms
  
