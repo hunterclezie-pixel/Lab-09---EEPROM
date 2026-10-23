@@ -135,7 +135,7 @@ Setup:
     BCF STATUS,7     ; IRP = 0: indirect addressing uses bank 0/1
  
     ; Begin in the locked state and initialize pin
-    CALL InitializePIN
+    ; CALL InitializePIN ;  To initialize the 
     MOVLW 0x4C       ; 'L' = locked
     CALL DisplayChar
     
