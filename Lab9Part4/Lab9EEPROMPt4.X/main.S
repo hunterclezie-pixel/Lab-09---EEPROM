@@ -1,6 +1,6 @@
 // Hunter Clezie
 // RCET3375
-// Lab9EEPROMPt3
+// Lab9EEPROMPt4
 // https://github.com/hunterclezie-pixel/Lab-09---EEPROM.git
 
 ; PIC16F883 Configuration Bit Settings
@@ -44,17 +44,41 @@
     key_code       EQU 0x2B ; Scanned key (0-15, FF = none)
     candidate_key  EQU 0x2C ; Key saved during debounce
     keyLow         EQU 0x2D ; Key status bits for keys 1,2,3,A,4,5,6,B
-    key_index      EQU 0x2E ; Scanned key position (0-15, FF = none)
+    mode	   EQU 0x2E ; Current lock service mod
     keyHigh        EQU 0x2F ; Key status bits for keys 7,8,9,C,*,0,#,D
     beep_count     EQU 0x30 ; Buzzer delay counter
     pulse_count    EQU 0x31 ; Timer0 overflow counter
     entry_error    EQU 0x32 ; Bit 0 = fifth digit entered
     pin_index      EQU 0x33 ; PIN comparison counter
+      
+    ; Two copies of the proposed PIN, kept in RAM only
+    new_pin1       EQU 0x34
+    new_pin2       EQU 0x35
+    new_pin3       EQU 0x36
+    new_pin4       EQU 0x37
+    confirm_pin1   EQU 0x38
+    confirm_pin2   EQU 0x39
+    confirm_pin3   EQU 0x3A
+    confirm_pin4   EQU 0x3B
+    pin_match      EQU 0x3C ; 1 = PIN matched, 0 = not matched
+    pin_update     EQU 0x3D ; Bit 0 = EEPROM update in progress
+    temp_digit     EQU 0x3E ; Temporary byte for RAM comparisons
 
     ; Constant (a number, NOT a register)
     TIMEOUT_OVERFLOWS EQU 15 ; 15 x 65.536 ms = about 1 second
     PIN_EE_START   EQU 0x00
     PIN_LENGTH     EQU 0x04
+    PIN_MARKER_ADDR EQU 0x04  ; Fifth EEPROM address
+    VALID_MARKER   EQU 0xC4  ; Only this value means PIN is valid
+   
+   ; Part 4 service modes
+    MODE_INVALID_NEW      EQU 0x00
+    MODE_INVALID_CONFIRM  EQU 0x01
+    MODE_LOCKED           EQU 0x02
+    MODE_ARMED            EQU 0x03 ; C was pressed; wait for #
+    MODE_CHANGE_AUTH      EQU 0x04
+    MODE_CHANGE_NEW       EQU 0x05
+    MODE_CHANGE_CONFIRM   EQU 0x06
 
     ; EEPROM status bit positions
     EEPROM_READ    EQU 0
@@ -111,6 +135,8 @@ Setup:
     CLRF TMR0        ; Clear Timer0 counter
     BCF INTCON,2     ; Clear Timer0 overflow flag
     BCF INTCON,7     ; Leave global interrupts disabled
+    CLRF T1CON      ; Timer1 starts OFF (used for nonblocking beeps)
+    BCF PIR1,0      ; Clear Timer1 overflow flag
  
     ; Clear all application registers
     CLRF pin_digit1
@@ -121,12 +147,23 @@ Setup:
     CLRF key_held
     CLRF candidate_key
     CLRF keyLow
-    CLRF key_index
+    CLRF mode
     CLRF keyHigh
     CLRF beep_count
     CLRF pulse_count
     CLRF entry_error
     CLRF pin_index
+    CLRF pin_match
+    CLRF pin_update
+    CLRF temp_digit
+    CLRF new_pin1
+    CLRF new_pin2
+    CLRF new_pin3
+    CLRF new_pin4
+    CLRF confirm_pin1
+    CLRF confirm_pin2
+    CLRF confirm_pin3
+    CLRF confirm_pin4
     CLRF ee_address
     CLRF ee_data
     CLRF ee_status
@@ -142,6 +179,8 @@ Setup:
 GOTO Main
  
 Main:
+    CALL ServiceBeep ; Finish beep without blocking keypad scans
+    
     ; Check for a keypad press
     CALL ScanKey
     BANKSEL key_code
@@ -370,78 +409,214 @@ SaveKeyIndex:
     MOVWF key_code   ; Save the actual key value
     RETURN
  
-; Handle one debounced keypad press
 HandleKey:
-    BANKSEL key_code
+    ; All keys reach this routine only once per debounced physical press
+    BANKSEL mode
     MOVLW STAR_KEY
     XORWF key_code,W
     BTFSC STATUS,2
-    GOTO CancelPIN
+    GOTO CancelPIN       ; * cancels in every service mode
+
+    ; C followed by # starts PIN change (only while locked)
+    MOVLW MODE_ARMED
+    XORWF mode,W
+    BTFSC STATUS,2
+    GOTO HandleArmed
+
+    MOVLW 0x0E           ; C key
+    XORWF key_code,W
+    BTFSC STATUS,2
+    GOTO HandleC
+
     MOVLW HASH_KEY
     XORWF key_code,W
     BTFSC STATUS,2
     GOTO SubmitPIN
- 
-    ; A-D do not change PIN entry
+
+    ; A, B, D or other unexpected non-numeric keys abort
     MOVLW 0x0A
-    SUBWF key_code,W    ; Carry=1 when key >= 10
+    SUBWF key_code,W     ; Carry = 1 when key >= 10
     BTFSC STATUS,0
-    RETURN
- 
-    ; Ignore digits after a fifth digit was already rejected
-    BTFSC entry_error,0
-    RETURN
- 
-    ; Reject a fifth digit, even if first four were correct
+    GOTO BadEntry
+
+    ; Only four digits may be entered before #
     MOVLW PIN_LENGTH
     XORWF digit_count,W
     BTFSC STATUS,2
-    GOTO TooManyDigits
- 
-    ; Store the entered digit: FSR = pin_digit1 + digit_count
+    GOTO BadEntry
+
+    ; Save numeric key in one of four RAM locations
     MOVF digit_count,W
     ADDLW pin_digit1
     MOVWF FSR
     MOVF key_code,W
     MOVWF INDF
     INCF digit_count,F
- 
-    ; Display how many digits have been entered (1-4)
+
     MOVF digit_count,W
-    ADDLW 0x30           ; ASCII '1' through '4'
+    ADDLW 0x30            ; Display 1, 2, 3 or 4
     CALL DisplayChar
     RETURN
- 
-TooManyDigits:
-    BSF entry_error,0
-    MOVLW 0x45           ; 'E' = rejected entry
+
+HandleC:
+    ; C is allowed only as the first key while normally locked
+    MOVLW MODE_LOCKED
+    XORWF mode,W
+    BTFSS STATUS,2
+    GOTO BadEntry
+    MOVF digit_count,F   ; Z = 1 when no digits entered
+    BTFSS STATUS,2
+    GOTO BadEntry
+    MOVLW MODE_ARMED
+    MOVWF mode
+    MOVLW 0x43            ; C = change request
     CALL DisplayChar
     RETURN
- 
-CancelPIN:
+
+HandleArmed:
+    MOVLW HASH_KEY
+    XORWF key_code,W
+    BTFSS STATUS,2
+    GOTO BadEntry      ; C must be followed immediately by #
     CALL ClearEntry
-    MOVLW 0x43           ; 'C' = canceled
+    MOVLW MODE_CHANGE_AUTH
+    MOVWF mode
+    MOVLW 0x41          ; A = enter current PIN to authenticate
     CALL DisplayChar
     RETURN
- 
+
 SubmitPIN:
-    ; An invalid length or fifth digit must never unlock
-    BTFSC entry_error,0
-    GOTO RejectPIN
+    ; A full entry is exactly four digits followed by #
     MOVLW PIN_LENGTH
     XORWF digit_count,W
     BTFSS STATUS,2
-    GOTO RejectPIN
-    CALL ComparePIN
+    GOTO BadEntry
+
+    MOVLW MODE_INVALID_NEW
+    XORWF mode,W
+    BTFSC STATUS,2
+    GOTO SaveFirstNewPIN
+
+    MOVLW MODE_INVALID_CONFIRM
+    XORWF mode,W
+    BTFSC STATUS,2
+    GOTO ConfirmNewPIN
+
+    MOVLW MODE_LOCKED
+    XORWF mode,W
+    BTFSC STATUS,2
+    GOTO NormalUnlock
+
+    MOVLW MODE_CHANGE_AUTH
+    XORWF mode,W
+    BTFSC STATUS,2
+    GOTO AuthenticateChange
+
+    MOVLW MODE_CHANGE_NEW
+    XORWF mode,W
+    BTFSC STATUS,2
+    GOTO SaveFirstNewPIN
+
+    MOVLW MODE_CHANGE_CONFIRM
+    XORWF mode,W
+    BTFSC STATUS,2
+    GOTO ConfirmNewPIN
+
+    GOTO BadEntry
+
+NormalUnlock:
+    CALL CurrentPINMatch
+    BANKSEL pin_match
+    MOVF pin_match,F
+    BTFSC STATUS,2
+    GOTO BadEntry
     CALL ClearEntry
-    RETURN
- 
-RejectPIN:
-    CALL ClearEntry
-    MOVLW 0x45           ; 'E' = wrong/incomplete PIN
+    MOVLW 0x55          ; U = unlocked
+    CALL DisplayChar
+    CALL SolenoidPulse  ; Only normal locked mode can unlock
+    MOVLW 0x4C          ; L = locked again
     CALL DisplayChar
     RETURN
- 
+
+AuthenticateChange:
+    CALL CurrentPINMatch
+    BANKSEL pin_match
+    MOVF pin_match,F
+    BTFSC STATUS,2
+    GOTO BadEntry      ; Incorrect old PIN cancels change
+    CALL ClearEntry
+    MOVLW MODE_CHANGE_NEW
+    MOVWF mode
+    MOVLW 0x4E          ; N = enter new PIN
+    CALL DisplayChar
+    RETURN
+
+SaveFirstNewPIN:
+    ; Copy first new PIN from entry RAM into new_pin1..new_pin4
+    CALL CopyNewPIN
+    CALL ClearEntry
+    MOVLW MODE_INVALID_NEW
+    XORWF mode,W
+    BTFSC STATUS,2
+    GOTO FirstInvalidSaved
+    MOVLW MODE_CHANGE_CONFIRM
+    MOVWF mode
+    GOTO ShowConfirmation
+
+FirstInvalidSaved:
+    MOVLW MODE_INVALID_CONFIRM
+    MOVWF mode
+ShowConfirmation:
+    MOVLW 0x46          ; F = enter new PIN again
+    CALL DisplayChar
+    RETURN
+
+ConfirmNewPIN:
+    ; Save confirmation in RAM and compare two complete groups
+    CALL CopyConfirmPIN
+    CALL NewPINMatch
+    BANKSEL pin_match
+    MOVF pin_match,F
+    BTFSC STATUS,2
+    GOTO BadEntry      ; A mismatch must not write EEPROM
+    CALL ClearEntry
+    CALL PINWrite       ; Only called after both new PINs match
+    RETURN
+
+CancelPIN:
+    CALL RestartMode
+    MOVLW 0x43          ; C = canceled
+    CALL DisplayChar
+    RETURN
+
+BadEntry:
+    CALL RestartMode
+    MOVLW 0x45          ; E = incorrect/incomplete/unexpected
+    CALL DisplayChar
+    RETURN
+
+RestartMode:
+    ; Invalid setup restarts from first new PIN; others return locked
+    BANKSEL mode
+    MOVLW MODE_INVALID_NEW
+    XORWF mode,W
+    BTFSC STATUS,2
+    GOTO RestartInvalid
+    MOVLW MODE_INVALID_CONFIRM
+    XORWF mode,W
+    BTFSC STATUS,2
+    GOTO RestartInvalid
+    MOVLW MODE_LOCKED
+    MOVWF mode
+    CALL ClearEntry
+    RETURN
+
+RestartInvalid:
+    MOVLW MODE_INVALID_NEW
+    MOVWF mode
+    CALL ClearEntry
+    RETURN
+
 ClearEntry:
     BANKSEL digit_count
     CLRF digit_count
@@ -451,60 +626,272 @@ ClearEntry:
     CLRF pin_digit3
     CLRF pin_digit4
     RETURN
- 
-ComparePIN:
-    ; Compare all four RAM digits with data EEPROM
-    BANKSEL pin_index
+
+; PART 4: Read the validity marker before allowing normal unlocking ------
+CheckPINRecord:
+    BANKSEL ee_address
+    MOVLW PIN_MARKER_ADDR
+    MOVWF ee_address
+    CALL EEPROMRead
+    BANKSEL ee_data
+    MOVLW VALID_MARKER
+    XORWF ee_data,W
+    BTFSS STATUS,2
+    GOTO StartInvalid
+
+    ; Even with a valid marker, reject digits outside 0 through 9
     CLRF pin_index
- 
-CompareNextDigit:
+CheckStoredDigit:
     MOVF pin_index,W
     ADDLW PIN_EE_START
     MOVWF ee_address
-    CALL EEPROMRead       ; Part 2 routine, stored digit returns in ee_data
- 
-    BANKSEL pin_index     ; EEPROMRead changes banks
-    MOVF pin_index,W
-    ADDLW pin_digit1
-    MOVWF FSR
-    MOVF INDF,W          ; Entered digit
-    XORWF ee_data,W      ; Compare with stored EEPROM digit
-    BTFSS STATUS,2
-    GOTO WrongPIN
+    CALL EEPROMRead
+    BANKSEL ee_data
+    MOVLW 0x0A
+    SUBWF ee_data,W      ; Carry = 1 when stored digit >= 10
+    BTFSC STATUS,0
+    GOTO StartInvalid
     INCF pin_index,F
     MOVLW PIN_LENGTH
     XORWF pin_index,W
     BTFSS STATUS,2
-    GOTO CompareNextDigit
- 
-    ; All four digits matched
-    MOVLW 0x55           ; 'U' = unlocked
-    CALL DisplayChar
-    CALL SolenoidPulse
-    MOVLW 0x4C           ; 'L' = locked again
-    CALL DisplayChar
-    RETURN
- 
-WrongPIN:
-    MOVLW 0x45           ; 'E' = incorrect PIN
+    GOTO CheckStoredDigit
+
+StartLocked:
+    BANKSEL mode
+    MOVLW MODE_LOCKED
+    MOVWF mode
+    CALL ClearEntry
+    MOVLW 0x4C           ; L = ready/locked
     CALL DisplayChar
     RETURN
- 
-BeepKey:
-    ; Sound the active buzzer for about 150 ms
+
+StartInvalid:
+    BANKSEL mode
+    MOVLW MODE_INVALID_NEW
+    MOVWF mode
+    CALL ClearEntry
+    MOVLW 0x4E           ; N = first-use new PIN required
+    CALL DisplayChar
+    RETURN
+
+CurrentPINMatch:
+    ; This routine NEVER operates the solenoid by itself.
+    BANKSEL pin_match
+    MOVLW 0x01
+    MOVWF pin_match
+    CLRF pin_index
+    
+CurrentNextDigit:
+    MOVF pin_index,W
+    ADDLW PIN_EE_START
+    MOVWF ee_address
+    CALL EEPROMRead
+    BANKSEL pin_index
+    MOVF pin_index,W
+    ADDLW pin_digit1
+    MOVWF FSR
+    MOVF INDF,W
+    XORWF ee_data,W
+    BTFSS STATUS,2
+    GOTO CurrentMismatch
+    INCF pin_index,F
+    MOVLW PIN_LENGTH
+    XORWF pin_index,W
+    BTFSS STATUS,2
+    GOTO CurrentNextDigit
+    RETURN
+    
+CurrentMismatch:
+    CLRF pin_match
+    RETURN
+
+CopyNewPIN:
+    ; Store the first new PIN and its confirmation in RAM
+    BANKSEL pin_index
+    CLRF pin_index
+    
+CopyNewLoop:
+    MOVF pin_index,W
+    ADDLW pin_digit1
+    MOVWF FSR
+    MOVF INDF,W
+    MOVWF temp_digit
+    MOVF pin_index,W
+    ADDLW new_pin1
+    MOVWF FSR
+    MOVF temp_digit,W
+    MOVWF INDF
+    INCF pin_index,F
+    MOVLW PIN_LENGTH
+    XORWF pin_index,W
+    BTFSS STATUS,2
+    GOTO CopyNewLoop
+    RETURN
+
+CopyConfirmPIN:
+    BANKSEL pin_index
+    CLRF pin_index
+    
+CopyConfirmLoop:
+    MOVF pin_index,W
+    ADDLW pin_digit1
+    MOVWF FSR
+    MOVF INDF,W
+    MOVWF temp_digit
+    MOVF pin_index,W
+    ADDLW confirm_pin1
+    MOVWF FSR
+    MOVF temp_digit,W
+    MOVWF INDF
+    INCF pin_index,F
+    MOVLW PIN_LENGTH
+    XORWF pin_index,W
+    BTFSS STATUS,2
+    GOTO CopyConfirmLoop
+    RETURN
+
+NewPINMatch:
+    ; NewPINMatch compares the two four-digit RAM groups
+    BANKSEL pin_match
+    MOVLW 0x01
+    MOVWF pin_match
+    CLRF pin_index
+    
+NewMatchLoop:
+    MOVF pin_index,W
+    ADDLW new_pin1
+    MOVWF FSR
+    MOVF INDF,W
+    MOVWF temp_digit
+    MOVF pin_index,W
+    ADDLW confirm_pin1
+    MOVWF FSR
+    MOVF INDF,W
+    XORWF temp_digit,W
+    BTFSS STATUS,2
+    GOTO NewMismatch
+    INCF pin_index,F
+    MOVLW PIN_LENGTH
+    XORWF pin_index,W
+    BTFSS STATUS,2
+    GOTO NewMatchLoop
+    RETURN
+    
+NewMismatch:
+    CLRF pin_match
+    RETURN
+
+; Save only after authentication/confirmation
+; Order: invalid marker, four digits, valid marker
+PINWrite:
     BANKSEL PORTA
-    BSF PORTA,1          ; Buzzer ON
-    MOVLW 0x0F
-    MOVWF beep_count     ; 15 x 10 ms
- 
-BeepLoop:
-    CALL Delay10ms
-    BANKSEL beep_count
-    DECFSZ beep_count,F
-    GOTO BeepLoop
-    BCF PORTA,1          ; Buzzer OFF
+    BCF PORTA,0          ; Never unlock during EEPROM updates
+    BSF pin_update,0    ; PIN_UPDATE flag
+    MOVLW 0x53          ; S = saving
+    CALL DisplayChar
+
+    ; Step 1: Invalidate marker before touching the stored digits
+    BANKSEL ee_address
+    MOVLW PIN_MARKER_ADDR
+    MOVWF ee_address
+    CLRF ee_data
+    CALL WritePINByte
+    BANKSEL ee_status
+    BTFSC ee_status,EEPROM_ERROR
+    GOTO PINWriteError
+
+    ; Steps 2-5: Write and verify each new digit
+    CLRF pin_index
+    
+PINWriteDigitLoop:
+    MOVF pin_index,W
+    ADDLW PIN_EE_START
+    MOVWF ee_address
+    MOVF pin_index,W
+    ADDLW new_pin1
+    MOVWF FSR
+    MOVF INDF,W
+    MOVWF ee_data
+    CALL WritePINByte
+    BANKSEL ee_status
+    BTFSC ee_status,EEPROM_ERROR
+    GOTO PINWriteError
+    INCF pin_index,F
+    MOVLW PIN_LENGTH
+    XORWF pin_index,W
+    BTFSS STATUS,2
+    GOTO PINWriteDigitLoop
+
+    ; Step 6: Valid marker written LAST
+    MOVLW PIN_MARKER_ADDR
+    MOVWF ee_address
+    MOVLW VALID_MARKER
+    MOVWF ee_data
+    CALL WritePINByte
+    BANKSEL ee_status
+    BTFSC ee_status,EEPROM_ERROR
+    GOTO PINWriteError
+
+    BCF pin_update,0    ; Writing completed and verified
+    CALL ClearEntry
+    MOVLW MODE_LOCKED
+    MOVWF mode
+    MOVLW 0x50          ; P = new PIN programmed successfully
+    CALL DisplayChar
     RETURN
- 
+
+WritePINByte:
+    ; Part 2 EEPROMWrite may skip unchanged bytes. Verify every step.
+    CALL EEPROMWrite
+    
+WaitPINWrite:
+    BANKSEL EECON1
+    BTFSC EECON1,1      ; WR=1 while write is in progress
+    GOTO WaitPINWrite
+    CALL EEPROMVerifyWrite
+    RETURN
+
+PINWriteError:
+    ; Stop permanently until a power cycle. No further PIN attempts.
+    BANKSEL PORTA
+    BCF PORTA,0          ; Solenoid OFF
+    BSF PORTA,2          ; RA2 error LED ON
+    BCF PORTA,1          ; Buzzer OFF
+    MOVLW 0x45          ; E = EEPROM error
+    CALL DisplayChar
+    
+PINErrorHalt:
+    GOTO PINErrorHalt
+
+BeepKey:
+    BANKSEL T1CON
+    CLRF T1CON         ; Stop Timer1 before reloading
+    MOVLW 0xB6
+    MOVWF TMR1H
+    MOVLW 0xC2
+    MOVWF TMR1L
+    BCF PIR1,0         ; Clear TMR1IF
+    BANKSEL PORTA
+    BSF PORTA,1        ; Active buzzer ON
+    BANKSEL T1CON
+    MOVLW 0x31         ; Timer1 on, Fosc/4, 1:8 prescaler
+    MOVWF T1CON
+    RETURN
+
+ServiceBeep:
+    BANKSEL T1CON
+    BTFSS T1CON,0      ; Timer1 not running?
+    RETURN
+    BTFSS PIR1,0       ; Not 150 ms yet?
+    RETURN
+    BCF T1CON,0        ; Stop timer
+    BANKSEL PORTA
+    BCF PORTA,1        ; Active buzzer OFF
+    BANKSEL PIR1
+    BCF PIR1,0
+    RETURN
+
 SolenoidPulse:
     ; Turn on the simulated solenoid for about one second
     BANKSEL PORTA
